@@ -45,6 +45,12 @@ class ConfigTests(Files, unittest.TestCase):
         self.assertEqual(validate({"paste_shortcut": "ctrl+shift+v"})["paste_shortcut"], "ctrl+shift+v")
         self.assertEqual(validate({"paste_shortcut": "CTRL+V"})["paste_shortcut"], "ctrl+v")
 
+    def test_push_to_talk_defaults_on_and_preserves_explicit_toggle_preference(self):
+        self.assertEqual(validate({})["activation"], "hold")
+        saved = validate({"activation": "toggle"})
+        self.assertEqual(saved["activation"], "toggle")
+        self.assertEqual(validate({"threads": 8}, saved)["activation"], "toggle")
+
     def test_strict_validation(self):
         for values in ({"threads": True}, {"translate": "false"}, {"max_duration": 0},
                        {"beam_size": 21}, {"threads": 65}, {"unknown": 1}, [],
@@ -373,7 +379,7 @@ class ShortcutTests(unittest.IsolatedAsyncioTestCase):
             b'[{"key":"V","modmask":68,"description":"Clipboard manager"}]', b"ok",
         ])
         shortcuts = Shortcuts(runner)
-        await shortcuts.apply(DEFAULTS["shortcut"], "toggle")
+        await shortcuts.apply(DEFAULTS["shortcut"], DEFAULTS["activation"])
         self.assertEqual(shortcuts.shortcut, "SUPER+ALT+V")
 
     async def test_collision_preserves_old_binding(self):
@@ -663,6 +669,23 @@ class DaemonTests(Files, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.daemon.history, [])
         self.assertFalse((self.paths.state / "history.json").exists())
         self.output.deliver.assert_awaited_once()
+
+    async def test_push_to_talk_records_until_release_then_pastes(self):
+        self.assertEqual(self.daemon.config["activation"], "hold")
+        self.shortcuts.held = AsyncMock(return_value=True)
+        self.daemon.models.transcribe = MagicMock(return_value="spoken words")
+        response = await self.daemon.request({"action": "start", "hotkey": True})
+        await asyncio.sleep(0)
+        self.assertEqual(response["phase"], "recording")
+        self.daemon.models.transcribe.assert_not_called()
+        self.output.deliver.assert_not_awaited()
+        self.shortcuts.held.return_value = False
+        await self.daemon.request({"action": "stop"})
+        await self.daemon.job
+        self.output.deliver.assert_awaited_once_with(
+            "spoken words", {"address": "0x123", "class": "editor"}, self.daemon.config,
+        )
+        self.assertEqual(self.daemon.phase, "idle")
 
     async def test_history_persists_and_clears(self):
         self.daemon.models.transcribe = MagicMock(return_value="hello")

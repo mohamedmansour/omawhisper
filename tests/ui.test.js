@@ -21,6 +21,22 @@ test("choice navigation wraps and keeps option types", () => {
   assert.equal(Settings.cycle([], "default", 1), "default");
 });
 
+test("push-to-talk switch maps on/off to the existing activation modes", () => {
+  const row = Settings.general({}).find(row => row.key === "activation");
+  assert.equal(row.title, "Push to talk");
+  assert.equal(row.kind, "toggle");
+  assert.equal(Settings.toggleValue(row, true), "hold");
+  assert.equal(Settings.toggleValue(row, false), "toggle");
+});
+
+test("ordinary switches still emit boolean values", () => {
+  const rows = [...Settings.general({}), ...Settings.audio([]), ...Settings.advanced()];
+  for (const row of rows.filter(row => row.kind === "toggle" && row.key !== "activation")) {
+    assert.equal(Settings.toggleValue(row, true), true, row.key);
+    assert.equal(Settings.toggleValue(row, false), false, row.key);
+  }
+});
+
 test("all requested settings are reachable via generated keyboard rows", () => {
   const rows = [...Settings.general({}), ...Settings.audio([]), ...Settings.advanced()];
   const keys = rows.map(row => row.key);

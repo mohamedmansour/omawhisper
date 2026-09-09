@@ -46,8 +46,9 @@ The microphone is never opened until you activate dictation.
 
 ## Dictation
 
-**Super + Alt + V** starts recording; press it again to stop and transcribe.
-In **Hold** mode, hold the shortcut while speaking and release to transcribe.
+**Push to talk is on by default.** Hold **Super + Alt + V** while speaking,
+then release to transcribe and insert your words into the focused application.
+Turn off **General > Push to talk** to press once to start and again to stop.
 The default deliberately avoids Omarchy's clipboard-manager shortcut.
 
 Focus a text input before starting. The settings panel is not opened by
@@ -74,7 +75,7 @@ Middle-click the microphone to cancel. The CLI also supports cancellation:
 
 | Tab | Settings |
 | --- | --- |
-| General | Activation shortcut, toggle/hold mode, paste/clipboard output, left/middle/right bar placement, clipboard preservation, trailing space |
+| General | Activation shortcut, push-to-talk switch (on by default), paste/clipboard output, left/middle/right bar placement, clipboard preservation, trailing space |
 | Models | Download, load, unload and remove models; add compatible Hugging Face repositories, local models or custom engines |
 | Audio | Microphone, language, translation to English, silence filtering, recording time limit |
 | Advanced | Vocabulary prompt, greedy/beam search, temperature, no-speech threshold, blank suppression, timestamps, CPU precision/threads, paste shortcut, opt-in history |
@@ -95,8 +96,8 @@ The portable recognition settings follow OpenSuperWhisper's
 [`AppPreferences.swift`](https://github.com/Starmel/OpenSuperWhisper/blob/master/OpenSuperWhisper/Utils/AppPreferences.swift):
 greedy decoding by default, beam size 5 when enabled, temperature 0, no-speech
 threshold 0.6, blank suppression on and timestamps off. Linux-specific
-differences are intentional: toggle recording and automatic language detection
-are the defaults, recording retention is replaced by opt-in text history, and
+differences are intentional: language detection is automatic by default,
+recording retention is replaced by opt-in text history, and
 Apple's modifier-only/Fn triggers and Asian-language autocorrection library
 are not emulated. Translation is an additional Whisper capability.
 

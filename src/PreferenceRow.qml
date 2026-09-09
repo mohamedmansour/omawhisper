@@ -10,6 +10,7 @@ Item {
     property var value
     property bool hasCursor: false
     property bool editing: false
+    readonly property bool checked: value === Settings.toggleValue(spec, true)
     signal engaged()
     signal modified(var value)
     signal activated()
@@ -22,7 +23,7 @@ Item {
         if (spec.kind === "choice")
             modified(Settings.cycle(spec.options || [], value, direction));
         else if (spec.kind === "toggle")
-            modified(!value);
+            modified(Settings.toggleValue(spec, !checked));
         else if (spec.kind === "number")
             modified(Number(Math.max(spec.from, Math.min(spec.to, Number(value) + spec.step * direction)).toFixed(6)));
     }
@@ -113,7 +114,7 @@ Item {
             anchors.verticalCenter: parent.verticalCenter
             text: {
                 if (root.spec.kind === "toggle")
-                    return root.value ? "On" : "Off";
+                    return root.checked ? "On" : "Off";
                 if (root.spec.kind === "choice") {
                     var match = (root.spec.options || []).find(function (o) { return o.value === root.value; });
                     return (match ? match.label : String(root.value || "Default")) + "  >";
@@ -134,7 +135,7 @@ Item {
             anchors.right: parent.right
             anchors.rightMargin: Style.space(10)
             anchors.verticalCenter: parent.verticalCenter
-            checked: root.value === true
+            checked: root.checked
             foreground: root.controller.foreground
             interactive: false
         }

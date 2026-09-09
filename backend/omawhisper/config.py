@@ -10,7 +10,7 @@ import uuid
 
 
 DEFAULTS = {
-    "shortcut": "SUPER+ALT+V", "activation": "toggle", "model": "whisper-base",
+    "shortcut": "SUPER+ALT+V", "activation": "hold", "model": "whisper-base",
     "language": "auto", "translate": False, "device": "", "output": "paste",
     "paste_shortcut": "auto", "restore_clipboard": True, "append_space": True,
     "history": False, "max_duration": 120, "beam_size": 5, "initial_prompt": "",

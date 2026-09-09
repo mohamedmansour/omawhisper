@@ -7,7 +7,7 @@ function choices(values) {
 function general(config) {
     return [
         { key: "shortcut", title: "Activation shortcut", help: "Enter a chord, for example SUPER+ALT+V. Existing bindings are never replaced.", kind: "text" },
-        { key: "activation", title: "Recording mode", help: "Toggle twice, or hold the shortcut and release to transcribe.", kind: "choice", options: choices(["toggle", "hold"]) },
+        { key: "activation", title: "Push to talk", help: "Hold the activation shortcut to record; release to transcribe and insert. Off: press once to start, again to stop.", kind: "toggle", enabledValue: "hold", disabledValue: "toggle" },
         { key: "output", title: "Insert text", help: "Paste into the original focused window, or only copy to the clipboard.", kind: "choice", options: choices([{ value: "paste", label: "Paste at cursor" }, { value: "clipboard", label: "Clipboard only" }]) },
         { key: "bar_section", title: "Bar position", help: "Place the microphone on the left, middle or right.", kind: "choice", options: choices([{ value: "left", label: "Left" }, { value: "center", label: "Middle" }, { value: "right", label: "Right" }]) },
         { key: "restore_clipboard", title: "Preserve clipboard", help: "Restore the previous clipboard after pasting, unless it has changed.", kind: "toggle" },
@@ -52,5 +52,10 @@ function cycle(options, value, direction) {
     return options[(Math.max(0, index) + direction + options.length) % options.length].value;
 }
 
+function toggleValue(spec, enabled) {
+    var value = enabled ? spec.enabledValue : spec.disabledValue;
+    return value === undefined ? enabled : value;
+}
+
 if (typeof module !== "undefined")
-    module.exports = { general: general, audio: audio, advanced: advanced, moveCursor: moveCursor, cycle: cycle };
+    module.exports = { general: general, audio: audio, advanced: advanced, moveCursor: moveCursor, cycle: cycle, toggleValue: toggleValue };
