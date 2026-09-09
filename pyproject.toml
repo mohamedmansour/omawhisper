@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "omawhisper"
+version = "0.1.0"
+description = "Local dictation service for the Omarchy desktop"
+requires-python = ">=3.11"
+dependencies = []
+license = "MIT"
+
+[project.optional-dependencies]
+whisper = ["faster-whisper>=1.1,<2"]
+parakeet = ["onnx-asr[cpu,hub]>=0.10,<1"]
+all = ["faster-whisper>=1.1,<2", "onnx-asr[cpu,hub]>=0.10,<1"]
+engines = ["faster-whisper>=1.1,<2", "onnx-asr[cpu,hub]>=0.10,<1"]
+
+[project.scripts]
+omawhisper = "omawhisper.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["backend"]

@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "mohamedmansour.whisper",
+  "name": "Omawhisper",
+  "version": "0.1.0",
+  "author": "mohamedmansour",
+  "license": "MIT",
+  "description": "Local voice dictation, right where you are typing.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {"barWidget": "src/BarWidget.qml"},
+  "barWidget": {
+    "displayName": "Omawhisper",
+    "description": "Microphone, live audio meter and keyboard-first dictation settings",
+    "category": "Tools",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {},
+    "schema": []
+  }
+}
