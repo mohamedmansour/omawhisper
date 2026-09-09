@@ -596,12 +596,21 @@ test("engine-specific settings cannot be edited for Parakeet or custom engines",
     assert.notEqual(rows.find(row => row.key === key).whisperOnly, true, key);
 });
 
-test("manifest entry points exist", () => {
+test("manifest entry points and README screenshots exist", () => {
   const manifest = JSON.parse(fs.readFileSync(path.join(root, "manifest.json"), "utf8"));
   assert.equal(manifest.id, "mohamedmansour.whisper");
   assert.equal(manifest.barWidget.defaultSection, "right");
   for (const entry of Object.values(manifest.entryPoints))
     assert.ok(fs.existsSync(path.join(root, entry)));
+  assert.equal(manifest.homepage, "https://github.com/mohamedmansour/omawhisper");
+  assert.ok(manifest.screenshots.length > 0);
+  const readme = fs.readFileSync(path.join(root, "README.md"), "utf8");
+  for (const screenshot of manifest.screenshots) {
+    assert.match(screenshot, /^assets\/screenshots\/[^/]+\.png$/);
+    const image = fs.readFileSync(path.join(root, screenshot));
+    assert.equal(image.subarray(0, 8).toString("hex"), "89504e470d0a1a0a");
+    assert.ok(readme.includes(`](${screenshot})`));
+  }
 });
 
 test("QML components parse with the installed Qt tooling", () => {

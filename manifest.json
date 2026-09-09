@@ -5,9 +5,18 @@
   "version": "0.1.0",
   "author": "mohamedmansour",
   "license": "MIT",
-  "description": "Local voice dictation, right where you are typing.",
-  "kinds": ["bar-widget"],
-  "entryPoints": {"barWidget": "src/BarWidget.qml"},
+  "description": "Local Whisper and Parakeet dictation with push-to-talk and GPU acceleration.",
+  "homepage": "https://github.com/mohamedmansour/omawhisper",
+  "screenshots": [
+    "assets/screenshots/general.png",
+    "assets/screenshots/models.png"
+  ],
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "src/BarWidget.qml"
+  },
   "barWidget": {
     "displayName": "Omawhisper",
     "description": "Microphone, live audio meter and keyboard-first dictation settings",
