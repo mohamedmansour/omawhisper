@@ -8,11 +8,15 @@ from pathlib import Path
 import re
 import selectors
 import shutil
+import stat
 import subprocess
 import threading
 import time
 
 from .config import UserError, atomic_json
+from .acceleration import onnx_gpu_compatible
+from .engine_worker import EngineWorker, WorkerCancelled, engine_python
+from .memory import GIB, MIB, memory_error, memory_status
 
 
 ENGINE_NAMES = {"faster-whisper": "whisper", "onnx-asr": "parakeet", "command": "command"}
@@ -50,13 +54,6 @@ def onnx_download_files(filenames: list[str], quantization: str | None) -> list[
     return sorted(result)
 
 
-def timestamp(seconds: float) -> str:
-    milliseconds = round(seconds * 1000)
-    minutes, milliseconds = divmod(milliseconds, 60000)
-    whole_seconds, milliseconds = divmod(milliseconds, 1000)
-    return f"{minutes:02d}:{whole_seconds:02d}.{milliseconds:03d}"
-
-
 def catalog() -> list[dict]:
     entries = []
     for size in ("tiny", "base", "small", "medium", "large-v3", "turbo",
@@ -66,17 +63,25 @@ def catalog() -> list[dict]:
             source = "mobiuslabsgmbh/faster-whisper-large-v3-turbo"
         entries.append({
             "id": f"whisper-{size}", "name": f"Whisper {size}", "engine": "faster-whisper",
-            "source": source, "description": "Local CPU speech recognition; " +
+            "source": source, "description": "Local CPU / NVIDIA GPU speech recognition; " +
             ("English-only transcription; no translation." if size.endswith(".en") else
              "multilingual transcription; turbo is not trained for translation." if size == "turbo" else
              "multilingual transcription and English translation."),
         })
     entries.append({
-        "id": "parakeet-v3", "name": "Parakeet TDT 0.6B v3", "engine": "onnx-asr",
+        "id": "parakeet-v3", "name": "Parakeet TDT 0.6B v3 INT8", "engine": "onnx-asr",
         "source": "istupakov/parakeet-tdt-0.6b-v3-onnx",
         "architecture": "nemo-parakeet-tdt-0.6b-v3",
         "quantization": "int8",
-        "description": "Local ONNX multilingual recognition; automatic language, no translation or prompts.",
+        "estimated_ram_bytes": 1536 * MIB,
+        "description": "Compact CPU INT8 weights (~670 MB); automatic language, no translation or prompts.",
+    })
+    entries.append({
+        "id": "parakeet-v3-fp32", "name": "Parakeet TDT 0.6B v3 FP32", "engine": "onnx-asr",
+        "source": "istupakov/parakeet-tdt-0.6b-v3-onnx",
+        "architecture": "nemo-parakeet-tdt-0.6b-v3", "quantization": "",
+        "estimated_ram_bytes": 5 * GIB,
+        "description": "GPU-compatible FP32 weights (~2.5 GB); NVIDIA CUDA or CPU, automatic language.",
     })
     return entries
 
@@ -147,6 +152,7 @@ class Models:
         self.loaded_id = None
         self.instance = None
         self.load_key = None
+        self.runtime = {}
         self.progress = {}
 
     def get(self, identifier: str) -> dict:
@@ -171,12 +177,64 @@ class Models:
         return any(path.rglob("*.onnx")) or any(path.rglob("*.ort"))
 
     def snapshot(self) -> list[dict]:
+        instance = self.instance
+        alive = not isinstance(instance, EngineWorker) or instance.alive
+        memory = memory_status()
+        entries = tuple(self.entries.values())
+        estimates = {model["id"]: self.memory_requirement(model)
+                     for model in entries if model["engine"] == "onnx-asr"}
         return [{
             **{key: model[key] for key in ("id", "name", "engine", "source", "description")},
             "engine": ENGINE_NAMES[model["engine"]],
-            "installed": self.installed(model), "loaded": self.loaded_id == model["id"],
+            **({
+                "quantization": onnx_quantization(model) or "",
+                "gpu_compatible": onnx_gpu_compatible(onnx_quantization(model)),
+                "estimated_ram_bytes": estimates[model["id"]],
+                "memory_error": memory_error(model["name"], estimates[model["id"]], memory["total"]),
+            } if model["engine"] == "onnx-asr" else {}),
+            "installed": self.installed(model), "loaded": alive and self.loaded_id == model["id"],
             "progress": self.progress.get(model["id"], 100 if self.installed(model) else 0),
-        } for model in tuple(self.entries.values())]
+        } for model in entries]
+
+    def runtime_snapshot(self) -> dict:
+        instance = self.instance
+        if isinstance(instance, EngineWorker) and not instance.alive:
+            return {}
+        return dict(self.runtime)
+
+    def memory_requirement(self, model: dict) -> int:
+        if model["engine"] != "onnx-asr":
+            return 0
+        directory = self.directory(model)
+        files = {}
+        for path in directory.rglob("*"):
+            relative = path.relative_to(directory)
+            if ".cache" in relative.parts:
+                continue
+            try:
+                info = path.stat()
+            except FileNotFoundError:
+                # Status snapshots can overlap removal of downloaded model files.
+                continue
+            if stat.S_ISREG(info.st_mode):
+                files[str(relative)] = info.st_size
+        selected = onnx_download_files(list(files), onnx_quantization(model))
+        weights = sum(files[name] for name in selected
+                      if Path(name).suffix not in {".json", ".yaml", ".yml", ".txt", ".model"})
+        # Initializers and optimized weights can coexist while ORT builds its sessions.
+        estimate = weights * 2 + 256 * MIB if weights else 0
+        return max(model.get("estimated_ram_bytes", 0), estimate)
+
+    def check_memory(self, identifier: str, *, available: bool = False) -> None:
+        model = self.get(identifier)
+        required = self.memory_requirement(model)
+        if not required:
+            return
+        memory = memory_status()
+        error = memory_error(model["name"], required,
+                             memory["available" if available else "total"], available=available)
+        if error:
+            raise UserError(error)
 
     def add(self, raw: dict) -> None:
         if len(self.custom) >= 100:
@@ -190,6 +248,9 @@ class Models:
 
     def check_settings(self, identifier: str, config: dict) -> None:
         model = self.get(identifier)
+        if (model["engine"] == "onnx-asr" and config["acceleration"] == "gpu"
+                and not onnx_gpu_compatible(onnx_quantization(model))):
+            raise UserError("These quantized ONNX weights are CPU-oriented. Choose Parakeet v3 FP32 in Models for GPU inference.")
         if model["engine"] != "faster-whisper":
             unsupported = [key for key in ("translate", "initial_prompt", "show_timestamps") if config[key]]
             if config["language"] != "auto":
@@ -248,79 +309,59 @@ class Models:
             raise
 
     def unload(self) -> None:
+        if isinstance(self.instance, EngineWorker):
+            self.instance.close()
         self.instance = None
         self.loaded_id = None
         self.load_key = None
+        self.runtime = {}
         gc.collect()
 
-    def load(self, identifier: str, config: dict) -> None:
+    def load(self, identifier: str, config: dict, cancelled: threading.Event | None = None) -> None:
         self.check_settings(identifier, config)
         model = self.get(identifier)
-        key = identifier, config["compute_type"], config["threads"]
-        if key == self.load_key:
+        key = identifier, config["acceleration"], config["compute_type"], config["threads"]
+        if key == self.load_key and (not isinstance(self.instance, EngineWorker) or self.instance.alive):
             return
         if not self.installed(model):
             raise UserError(f"{model['name']} is not installed. Download it in Models first.")
+        self.check_memory(identifier)
         self.unload()
+        self.check_memory(identifier, available=True)
         path = str(self.directory(model))
-        if model["engine"] == "faster-whisper":
+        if model["engine"] in {"faster-whisper", "onnx-asr"}:
+            python = engine_python(self.paths, model["engine"], config["acceleration"],
+                                   onnx_gpu_compatible(onnx_quantization(model)))
+            instance = EngineWorker(python, model["engine"])
             try:
-                from faster_whisper import WhisperModel
-            except ImportError as exc:
-                raise UserError("faster-whisper is not installed. Install Omawhisper's whisper extra.") from exc
-            instance = WhisperModel(path, device="cpu", compute_type=config["compute_type"],
-                                    cpu_threads=config["threads"], local_files_only=True)
-        elif model["engine"] == "onnx-asr":
-            try:
-                import onnx_asr
-                import onnxruntime
-            except ImportError as exc:
-                raise UserError("onnx-asr is not installed. Install Omawhisper's parakeet extra.") from exc
-            options = onnxruntime.SessionOptions()
-            options.intra_op_num_threads = config["threads"]
-            options.inter_op_num_threads = 1
-            architecture = model.get("architecture") or model["source"]
-            if Path(architecture).is_absolute():
-                config_path = Path(path) / "config.json"
-                metadata = json.loads(config_path.read_text()) if config_path.is_file() else {}
-                architecture = metadata.get("model_type")
-                if type(architecture) is not str or not architecture or "/" in architecture:
-                    raise UserError("Local ONNX models require config.json model_type or an architecture field, e.g. nemo-conformer-tdt.")
-            instance = onnx_asr.load_model(
-                architecture, path=path,
-                quantization=onnx_quantization(model),
-                sess_options=options, providers=["CPUExecutionProvider"],
-            )
+                runtime = instance.request("load", model=model, path=str(Path(path).resolve()),
+                                           config=config, cancelled=cancelled)
+            except WorkerCancelled:
+                instance.close()
+                return
+            except BaseException:
+                instance.close()
+                raise
         else:
             instance = model["argv"]
+            runtime = {"device": "external", "provider": "", "compute_type": "",
+                       "detail": "The custom command manages its own hardware and precision."}
         self.instance, self.loaded_id, self.load_key = instance, identifier, key
+        self.runtime = runtime
 
     def transcribe(self, audio: Path, identifier: str, config: dict, cancelled: threading.Event) -> str:
-        self.load(identifier, config)
+        self.load(identifier, config, cancelled)
         if cancelled.is_set():
             return ""
         model = self.get(identifier)
-        if model["engine"] == "faster-whisper":
-            segments, _ = self.instance.transcribe(
-                str(audio), language=None if config["language"] == "auto" else config["language"],
-                task="translate" if config["translate"] else "transcribe",
-                beam_size=config["beam_size"] if config["use_beam_search"] else 1, best_of=5,
-                initial_prompt=config["initial_prompt"] or None,
-                vad_filter=config["vad"],
-                suppress_blank=config["suppress_blank"], without_timestamps=not config["show_timestamps"],
-                temperature=config["temperature"], no_speech_threshold=config["no_speech_threshold"],
-            )
-            result = []
-            for segment in segments:
-                if cancelled.is_set():
-                    return ""
-                if config["show_timestamps"]:
-                    result.append(f"[{timestamp(segment.start)}->{timestamp(segment.end)}] {segment.text.strip()}")
-                else:
-                    result.append(segment.text)
-            text = ("\n" if config["show_timestamps"] else "").join(result).strip()
-        elif model["engine"] == "onnx-asr":
-            text = self.instance.recognize(str(audio))
+        if model["engine"] in {"faster-whisper", "onnx-asr"}:
+            try:
+                text = self.instance.request("transcribe", audio=str(audio.resolve()), config=config, cancelled=cancelled)
+            except WorkerCancelled:
+                return ""
+            finally:
+                if not self.instance.alive:
+                    self.unload()
         else:
             argv = [arg.replace("{audio}", str(audio)) for arg in self.instance]
             process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)

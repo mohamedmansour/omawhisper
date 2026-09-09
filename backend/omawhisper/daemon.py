@@ -19,14 +19,17 @@ import uuid
 
 from . import audio
 from .config import DEFAULTS, Paths, UserError, atomic_json, validate
-from .models import Models
+from .models import Models, onnx_quantization
 from .output import Output
 from .shortcuts import Shortcuts
+from .acceleration import cuda_available, onnx_gpu_compatible
+from .engine_worker import WorkerCancelled
+from .setup import install_runtimes
 
 
 LOG = logging.getLogger(__name__)
 LIMIT = 2 * 1024 * 1024
-BUSY = {"recording", "transcribing", "loading", "downloading"}
+BUSY = {"recording", "transcribing", "loading", "downloading", "installing"}
 
 
 class Daemon:
@@ -63,6 +66,7 @@ class Daemon:
         self.socket_identity = None
         self.event_task = None
         self.heartbeat_task = None
+        self.setup_running = False
         self._load_history()
 
     def _load_history(self) -> None:
@@ -85,6 +89,7 @@ class Daemon:
             "phase": self.phase, "level": float(self.level), "elapsed": self.elapsed,
             "error": self.error, "message": self.message, "transcript": self.transcript,
             "model_name": selected["name"], "config": dict(self.config),
+            "runtime": self.models.runtime_snapshot(),
             "models": self.models.snapshot(), "devices": list(self.devices), "history": list(self.history),
         }
 
@@ -128,6 +133,9 @@ class Daemon:
             self.publish()
 
     async def request(self, command: dict) -> dict:
+        # Cancellation must reach workers even while a final shortcut update owns the lock.
+        if type(command) is dict and command == {"action": "cancel"} and self._busy():
+            self.cancelled.set()
         async with self.lock:
             try:
                 await self._request(command)
@@ -141,7 +149,7 @@ class Daemon:
             raise UserError("Request must be an object containing a string action.")
         action = command["action"]
         extra = {
-            "configure": {"values"}, "download": {"id"}, "load": {"id"},
+            "configure": {"values"}, "setup": {"values"}, "download": {"id"}, "load": {"id"},
             "remove_model": {"id"}, "add_model": {"model"}, "copy": {"text"},
             "start": {"hotkey"},
         }.get(action, set())
@@ -174,6 +182,7 @@ class Daemon:
             selected = self.models.get(self.config["model"])
             if not self.models.installed(selected):
                 raise UserError(f"{selected['name']} is not installed. Download it in Models or provide its local files/executable before recording.")
+            self.models.check_memory(self.config["model"])
             target = await self.output.focused() if self.config["output"] == "paste" else {}
             settings = dict(self.config)
             capture = self.capture_factory(self.paths.runtime, settings["device"], settings["max_duration"], self._meter)
@@ -190,12 +199,32 @@ class Daemon:
                     await self.capture.stop(cancel=True)
                 self.message = "Cancelled. Waiting for the local worker to release resources."
                 self.publish()
+        elif action == "setup":
+            self.require_idle()
+            values = command.get("values")
+            # Accept the original full request from older clients, while new setup only owns model/device.
+            if type(values) is not dict or set(values) not in (
+                {"model", "acceleration"}, {"model", "acceleration", "activation", "shortcut"},
+            ):
+                raise UserError("Setup requires model and acceleration choices.")
+            config = validate(values, self.config)
+            if config["acceleration"] != self.config["acceleration"]:
+                config["compute_type"] = "auto"
+            if self.models.get(config["model"])["engine"] != "faster-whisper":
+                config.update(language="auto", translate=False, initial_prompt="", show_timestamps=False)
+            self.models.check_settings(config["model"], config)
+            self.setup_running = True
+            self.phase, self.error, self.message = "installing", "", "Preparing your local dictation setup..."
+            self._launch(self._setup_job(config))
+            self.publish()
         elif action == "configure":
+            if self.setup_running:
+                self.require_idle()
             values = command.get("values")
             config = validate(values, self.config)
             self.models.check_settings(config["model"], config)
             changes = {key for key in config if config[key] != self.config[key]}
-            reload_model = bool(changes & {"model", "compute_type", "threads"})
+            reload_model = bool(changes & {"model", "acceleration", "compute_type", "threads"})
             if reload_model:
                 self.require_idle()
             old = self.config
@@ -259,6 +288,66 @@ class Daemon:
         self.level, self.elapsed = float(level), elapsed
         self.publish()
 
+    async def _setup_job(self, config: dict) -> None:
+        committed = False
+        replaced = False
+        try:
+            model = self.models.get(config["model"])
+            self.models.check_memory(model["id"])
+            cuda = False
+            if config["acceleration"] != "cpu" and model["engine"] != "command":
+                compatible = model["engine"] == "faster-whisper" or onnx_gpu_compatible(onnx_quantization(model))
+                if compatible:
+                    cuda, detail = await asyncio.to_thread(cuda_available)
+                    if config["acceleration"] == "gpu" and not cuda:
+                        raise UserError(detail)
+            await asyncio.to_thread(self.models.unload)
+            replaced = True
+            self.models.check_memory(model["id"], available=True)
+            if model["engine"] != "command":
+                def progress(message):
+                    self.message = message
+                    self.publish()
+
+                await install_runtimes(cuda, self.cancelled, progress)
+            if not self.models.installed(model):
+                self.phase, self.message = "downloading", "Downloading " + model["name"] + "..."
+                self.publish()
+                await asyncio.to_thread(self.models.download, model["id"], self.cancelled)
+            if self.cancelled.is_set():
+                raise WorkerCancelled()
+            self.phase, self.message = "loading", "Loading and preparing " + model["name"] + "..."
+            self.publish()
+            await asyncio.to_thread(self.models.load, model["id"], config, self.cancelled)
+            async with self.lock:
+                if self.cancelled.is_set():
+                    raise WorkerCancelled()
+                old = self.config
+                await self.shortcuts.apply(config["shortcut"], config["activation"])
+                if self.cancelled.is_set():
+                    await self.shortcuts.apply(old["shortcut"], old["activation"])
+                    raise WorkerCancelled()
+                selected = dict(config, setup_complete=True)
+                try:
+                    self.paths.save_config(selected)
+                except OSError:
+                    await self.shortcuts.apply(old["shortcut"], old["activation"])
+                    raise
+                self.config = selected
+                committed = True
+            self.idle("Setup complete. Focus a text input and use your activation shortcut.")
+        except WorkerCancelled:
+            self.idle("Setup cancelled. Previous settings were kept.")
+        except UserError:
+            if self.cancelled.is_set():
+                self.idle("Setup cancelled. Previous settings were kept.")
+            else:
+                raise
+        finally:
+            if not committed and replaced:
+                await asyncio.to_thread(self.models.unload)
+            self.setup_running = False
+
     async def _record(self, capture, target: dict, config: dict) -> None:
         try:
             path = await capture.wait()
@@ -300,7 +389,7 @@ class Daemon:
         if action == "download":
             await asyncio.to_thread(self.models.download, identifier, self.cancelled)
         elif action == "load":
-            await asyncio.to_thread(self.models.load, identifier, config)
+            await asyncio.to_thread(self.models.load, identifier, config, self.cancelled)
             try:
                 async with self.lock:
                     if not self.cancelled.is_set():
@@ -449,7 +538,6 @@ class Daemon:
         self.closed.set()
         if self.server:
             self.server.close()
-            await self.server.wait_closed()
         for task in (self.event_task, self.heartbeat_task):
             if task:
                 task.cancel()
@@ -462,6 +550,8 @@ class Daemon:
         for task in tuple(self.clients):
             task.cancel()
         await asyncio.gather(*self.clients, return_exceptions=True)
+        if self.server:
+            await self.server.wait_closed()
         try:
             await self.shortcuts.close()
         except Exception as exc:

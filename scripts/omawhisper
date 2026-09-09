@@ -2,9 +2,20 @@
 set -euo pipefail
 
 root="$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/.." && pwd)"
-python="${XDG_DATA_HOME:-$HOME/.local/share}/omawhisper/venv/bin/python"
+venv="${XDG_DATA_HOME:-$HOME/.local/share}/omawhisper/venv"
+python="$venv/bin/python"
 if [[ ! -x "$python" ]]; then
   python=python3
+fi
+# The dynamic linker reads this at process startup, before Python imports CTranslate2.
+cuda_libraries=""
+for library in "$venv"/lib/python*/site-packages/nvidia/cublas/lib; do
+  if [[ -d "$library" ]]; then
+    cuda_libraries="${cuda_libraries:+$cuda_libraries:}$library"
+  fi
+done
+if [[ -n "$cuda_libraries" ]]; then
+  export LD_LIBRARY_PATH="$cuda_libraries${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 fi
 export PYTHONPATH="$root/backend${PYTHONPATH:+:$PYTHONPATH}"
 exec "$python" -m omawhisper.cli "$@"

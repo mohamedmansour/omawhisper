@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import shutil
 import struct
+import subprocess
 import sys
 import threading
 import types
@@ -14,9 +15,11 @@ import uuid
 import wave
 
 from omawhisper.audio import Capture, rms
+from omawhisper.acceleration import whisper_runtime
 from omawhisper.config import DEFAULTS, Paths, UserError, atomic_json, validate
 from omawhisper.daemon import Daemon
 from omawhisper.models import Models, onnx_download_files, validate_model
+from omawhisper.engines import OnnxEngine, WhisperEngine
 from omawhisper.output import MIME, Output
 from omawhisper.shortcuts import Shortcuts, lua_string
 
@@ -45,11 +48,27 @@ class ConfigTests(Files, unittest.TestCase):
         self.assertEqual(validate({"paste_shortcut": "ctrl+shift+v"})["paste_shortcut"], "ctrl+shift+v")
         self.assertEqual(validate({"paste_shortcut": "CTRL+V"})["paste_shortcut"], "ctrl+v")
 
+    def test_symbol_shortcut_key_names(self):
+        for key in ("COMMA", "PERIOD", "SLASH", "SEMICOLON", "APOSTROPHE",
+                    "BRACKETLEFT", "BRACKETRIGHT", "BACKSLASH", "GRAVE", "MINUS", "EQUAL", "PLUS"):
+            with self.subTest(key=key):
+                self.assertEqual(validate({"shortcut": f"super + {key.lower()}"})["shortcut"], f"SUPER+{key}")
+
     def test_push_to_talk_defaults_on_and_preserves_explicit_toggle_preference(self):
         self.assertEqual(validate({})["activation"], "hold")
         saved = validate({"activation": "toggle"})
         self.assertEqual(saved["activation"], "toggle")
         self.assertEqual(validate({"threads": 8}, saved)["activation"], "toggle")
+
+    def test_acceleration_defaults_and_preserves_existing_precision(self):
+        self.assertEqual(validate({})["acceleration"], "auto")
+        self.assertEqual(validate({})["compute_type"], "auto")
+        saved = validate({"compute_type": "int8", "device": "alsa_input.usb"})
+        result = validate({"acceleration": "gpu"}, saved)
+        self.assertEqual(result["compute_type"], "int8")
+        self.assertEqual(result["device"], "alsa_input.usb")
+        for precision in ("float16", "int8_float16", "int8_float32", "float32"):
+            self.assertEqual(validate({"compute_type": precision})["compute_type"], precision)
 
     def test_strict_validation(self):
         for values in ({"threads": True}, {"translate": "false"}, {"max_duration": 0},
@@ -60,7 +79,8 @@ class ConfigTests(Files, unittest.TestCase):
                        {"temperature": "0.5"}, {"temperature": -0.1}, {"temperature": 1.1},
                        {"temperature": float("nan")}, {"no_speech_threshold": float("inf")},
                        {"no_speech_threshold": -0.1}, {"suppress_blank": 1},
-                       {"show_timestamps": "false"}, {"use_beam_search": 1}):
+                       {"show_timestamps": "false"}, {"use_beam_search": 1},
+                       {"acceleration": "cuda"}, {"acceleration": True}, {"compute_type": "fp16"}):
             with self.subTest(values=values), self.assertRaises(UserError):
                 validate(values)
 
@@ -86,14 +106,79 @@ class ConfigTests(Files, unittest.TestCase):
             Paths()
 
 
+class AccelerationTests(unittest.TestCase):
+    def setUp(self):
+        self.ct2 = MagicMock()
+        self.ct2.get_cuda_device_count.return_value = 0
+        self.ct2.get_supported_compute_types.side_effect = lambda device: (
+            {"float16", "float32", "int8_float16", "int8"} if device == "cuda"
+            else {"int8", "int8_float32", "float32"}
+        )
+
+    def test_auto_without_gpu_uses_cpu_and_explains_why(self):
+        runtime = whisper_runtime(self.ct2, validate({}))
+        self.assertEqual(runtime["device"], "cpu")
+        self.assertEqual(runtime["compute_type"], "int8")
+        self.assertIn("CUDA unavailable to CTranslate2", runtime["detail"])
+
+    def test_auto_prefers_gpu_and_gpu_precision(self):
+        self.ct2.get_cuda_device_count.return_value = 1
+        for mode in ("auto", "gpu"):
+            with self.subTest(mode=mode):
+                runtime = whisper_runtime(self.ct2, validate({"acceleration": mode}))
+                self.assertEqual(runtime["device"], "cuda")
+                self.assertEqual(runtime["compute_type"], "float16")
+
+    def test_explicit_cpu_never_probes_cuda(self):
+        self.ct2.get_cuda_device_count.side_effect = RuntimeError("broken CUDA")
+        runtime = whisper_runtime(self.ct2, validate({"acceleration": "cpu"}))
+        self.assertEqual(runtime["device"], "cpu")
+        self.ct2.get_cuda_device_count.assert_not_called()
+
+    def test_gpu_request_without_gpu_is_an_error(self):
+        with self.assertRaisesRegex(UserError, "No supported CUDA GPU"):
+            whisper_runtime(self.ct2, validate({"acceleration": "gpu"}))
+        self.ct2.get_supported_compute_types.assert_not_called()
+
+    def test_auto_precision_uses_only_supported_types(self):
+        self.ct2.get_supported_compute_types.side_effect = None
+        self.ct2.get_supported_compute_types.return_value = {"float32"}
+        for count, device in ((0, "cpu"), (1, "cuda")):
+            self.ct2.get_cuda_device_count.return_value = count
+            runtime = whisper_runtime(self.ct2, validate({}))
+            self.assertEqual(runtime["device"], device)
+            self.assertEqual(runtime["compute_type"], "float32")
+
+    def test_unsupported_explicit_precision_is_not_silently_changed(self):
+        with self.assertRaisesRegex(UserError, "float16 is not supported on CPU"):
+            whisper_runtime(self.ct2, validate({"compute_type": "float16"}))
+
+    def test_device_detection_failure_is_actionable(self):
+        self.ct2.get_cuda_device_count.side_effect = RuntimeError("driver failure")
+        with self.assertRaisesRegex(UserError, "Cannot detect CUDA.*driver failure"):
+            whisper_runtime(self.ct2, validate({}))
+
+    def test_initialization_failure_is_not_masked_as_cpu_success(self):
+        self.ct2.get_cuda_device_count.return_value = 1
+        self.ct2.get_supported_compute_types.side_effect = RuntimeError("missing CUDA library")
+        with self.assertRaisesRegex(UserError, "Cannot initialize CUDA.*missing CUDA library"):
+            whisper_runtime(self.ct2, validate({}))
+
+
 class ModelTests(Files, unittest.TestCase):
     def setUp(self):
         super().setUp()
         self.models = Models(self.paths)
+        self.ct2 = MagicMock()
+        self.ct2.get_cuda_device_count.return_value = 0
+        self.ct2.get_supported_compute_types.return_value = {"int8", "float32", "int8_float32", "float16"}
+        mock_ct2 = patch.dict(sys.modules, {"ctranslate2": self.ct2})
+        mock_ct2.start()
+        self.addCleanup(mock_ct2.stop)
 
     def test_catalog_and_snapshot_contract(self):
         rows = self.models.snapshot()
-        self.assertEqual(len(rows), 11)
+        self.assertEqual(len(rows), 12)
         self.assertEqual(set(rows[0]), {"id", "name", "engine", "source", "description", "installed", "loaded", "progress"})
         self.assertFalse(any(row["installed"] for row in rows))
         self.assertEqual(self.models.get("parakeet-v3")["engine"], "onnx-asr")
@@ -104,6 +189,26 @@ class ModelTests(Files, unittest.TestCase):
         self.models.add({"id": "custom-parakeet", "name": "Parakeet", "engine": "parakeet", "source": "owner/repo"})
         self.assertEqual(self.models.get("custom-whisper")["engine"], "faster-whisper")
         self.assertEqual(self.models.get("custom-parakeet")["engine"], "onnx-asr")
+
+    def test_snapshot_exposes_custom_onnx_quantization_and_gpu_compatibility(self):
+        variants = (
+            ("unquantized", {"quantization": ""}, "", True),
+            ("fp16", {"quantization": "fp16"}, "fp16", True),
+            ("fp32", {"quantization": "fp32"}, "fp32", True),
+            ("int8", {"quantization": "int8"}, "int8", False),
+            ("default", {}, "int8", False),
+        )
+        for identifier, extra, _, _ in variants:
+            self.models.add({"id": identifier, "name": identifier, "engine": "parakeet",
+                             "source": "owner/model", **extra})
+        rows = {row["id"]: row for row in self.models.snapshot()}
+        for identifier, _, quantization, compatible in variants:
+            with self.subTest(identifier=identifier):
+                self.assertEqual(rows[identifier]["quantization"], quantization)
+                self.assertIs(rows[identifier]["gpu_compatible"], compatible)
+        self.assertEqual(rows["parakeet-v3"]["quantization"], "int8")
+        self.assertIs(rows["parakeet-v3"]["gpu_compatible"], False)
+        self.assertNotIn("quantization", rows["whisper-base"])
 
     def test_snapshot_tolerates_model_removal_during_filesystem_checks(self):
         self.models.add({"id": "removed", "name": "Removed", "engine": "whisper", "source": "owner/repo"})
@@ -116,9 +221,9 @@ class ModelTests(Files, unittest.TestCase):
 
         self.models.installed = check_installed
         snapshot = self.models.snapshot()
-        self.assertEqual(len(snapshot), 12)
+        self.assertEqual(len(snapshot), 13)
         self.assertNotIn("removed", self.models.entries)
-        self.assertEqual(len(self.models.snapshot()), 11)
+        self.assertEqual(len(self.models.snapshot()), 12)
 
     def test_add_and_persist_command(self):
         model = {"id": "custom", "name": "Custom", "source": "local-command",
@@ -161,6 +266,15 @@ class ModelTests(Files, unittest.TestCase):
                 self.models.check_settings("parakeet-v3", validate(config))
         with self.assertRaises(UserError):
             self.models.check_settings("whisper-turbo", validate({"translate": True}))
+
+    def test_parakeet_gpu_requires_floating_weights(self):
+        with self.assertRaisesRegex(UserError, "CPU-oriented"):
+            self.models.load("parakeet-v3", validate({"acceleration": "gpu"}))
+        self.assertIsNone(self.models.instance)
+        self.assertEqual(self.models.runtime, {})
+        self.models.check_settings("parakeet-v3", validate({"acceleration": "auto"}))
+        self.models.check_settings("parakeet-v3", validate({"acceleration": "cpu"}))
+        self.models.check_settings("parakeet-v3-fp32", validate({"acceleration": "gpu"}))
 
     def test_partial_download_not_installed(self):
         model = self.models.get("whisper-base")
@@ -254,12 +368,18 @@ class ModelTests(Files, unittest.TestCase):
         self.models.add({"id": "local", "name": "Local", "engine": "faster-whisper", "source": str(directory.resolve())})
         module = types.ModuleType("faster_whisper")
         module.WhisperModel = MagicMock()
+        module.WhisperModel.return_value.model = types.SimpleNamespace(device="cpu", compute_type="int8_float32")
         module.WhisperModel.return_value.transcribe.return_value = ([types.SimpleNamespace(text=" Hello")], {})
+        engine = WhisperEngine()
         with patch.dict(sys.modules, {"faster_whisper": module}):
-            text = self.models.transcribe(Path("input.wav"), "local", validate({}), threading.Event())
+            runtime = engine.load(self.models.get("local"), str(directory.resolve()), validate({}))
+            text = engine.transcribe("input.wav", validate({}))
         self.assertEqual(text, "Hello")
         self.assertTrue(module.WhisperModel.call_args.kwargs["local_files_only"])
         self.assertEqual(module.WhisperModel.call_args.kwargs["device"], "cpu")
+        self.assertEqual(module.WhisperModel.call_args.kwargs["compute_type"], "int8")
+        self.assertEqual(runtime["device"], "cpu")
+        self.assertEqual(runtime["compute_type"], "int8_float32")
         options = module.WhisperModel.return_value.transcribe.call_args.kwargs
         self.assertEqual(options["beam_size"], 1)
         self.assertEqual(options["best_of"], 5)
@@ -269,6 +389,30 @@ class ModelTests(Files, unittest.TestCase):
         self.assertEqual(options["no_speech_threshold"], 0.6)
         self.models.unload()
         self.assertIsNone(self.models.instance)
+        self.assertEqual(self.models.runtime, {})
+
+    def test_whisper_gpu_loading(self):
+        module = types.ModuleType("faster_whisper")
+        module.WhisperModel = MagicMock(side_effect=lambda path, **options: types.SimpleNamespace(
+            model=types.SimpleNamespace(device=options["device"], compute_type=options["compute_type"])))
+        self.ct2.get_cuda_device_count.return_value = 1
+        with patch.dict(sys.modules, {"faster_whisper": module}):
+            runtime = WhisperEngine().load({}, "model", validate({}))
+            self.assertEqual(module.WhisperModel.call_args.kwargs["device"], "cuda")
+            self.assertEqual(module.WhisperModel.call_args.kwargs["compute_type"], "float16")
+            self.assertEqual(runtime["device"], "cuda")
+
+    def test_cuda_model_load_error_does_not_leave_a_loaded_gpu_label(self):
+        module = types.ModuleType("faster_whisper")
+        module.WhisperModel = MagicMock(side_effect=RuntimeError("out of memory"))
+        self.ct2.get_cuda_device_count.return_value = 1
+        with patch.dict(sys.modules, {"faster_whisper": module}):
+            with self.assertRaisesRegex(UserError, "CUDA model loading failed.*out of memory"):
+                WhisperEngine().load({}, "model", validate({}))
+        self.assertIsNone(self.models.instance)
+        self.assertIsNone(self.models.loaded_id)
+        self.assertEqual(self.models.runtime, {})
+        module.WhisperModel.assert_called_once()
 
     def test_beam_decoding_and_segment_timestamps(self):
         instance = MagicMock()
@@ -276,11 +420,11 @@ class ModelTests(Files, unittest.TestCase):
             types.SimpleNamespace(text=" Hello", start=0.0, end=1.25),
             types.SimpleNamespace(text=" world", start=1.25, end=62.1),
         ], {})
-        self.models.load = MagicMock()
-        self.models.instance = instance
+        engine = WhisperEngine()
+        engine.model = instance
         config = validate({"use_beam_search": True, "beam_size": 7, "show_timestamps": True,
                            "suppress_blank": False, "temperature": 0.4, "no_speech_threshold": 0.8})
-        text = self.models.transcribe(Path("input.wav"), "whisper-base", config, threading.Event())
+        text = engine.transcribe("input.wav", config)
         self.assertEqual(text, "[00:00.000->00:01.250] Hello\n[00:01.250->01:02.100] world")
         options = instance.transcribe.call_args.kwargs
         self.assertEqual(options["beam_size"], 7)
@@ -298,6 +442,17 @@ class ModelTests(Files, unittest.TestCase):
         asr.load_model = MagicMock()
         runtime = types.ModuleType("onnxruntime")
         runtime.SessionOptions = MagicMock()
+        runtime.get_available_providers = lambda: ["CPUExecutionProvider"]
+
+        class Session:
+            def get_providers(self):
+                return ["CPUExecutionProvider"]
+
+            def disable_fallback(self):
+                pass
+
+        runtime.InferenceSession = Session
+        asr.load_model.return_value.asr = types.SimpleNamespace(encoder=Session())
         cases = (
             ("empty", {"quantization": ""}, "int8", None),
             ("int8", {"quantization": "int8"}, "float32", "int8"),
@@ -309,8 +464,11 @@ class ModelTests(Files, unittest.TestCase):
                 with self.subTest(identifier=identifier):
                     self.models.add({"id": identifier, "name": "ONNX", "engine": "parakeet",
                                      "source": str(directory.resolve()), **extra})
-                    self.models.load(identifier, validate({"compute_type": compute}))
+                    result = OnnxEngine().load(self.models.get(identifier), str(directory.resolve()), validate({"compute_type": compute}))
                     self.assertEqual(asr.load_model.call_args.kwargs["quantization"], expected)
+                    self.assertEqual(asr.load_model.call_args.kwargs["providers"], ["CPUExecutionProvider"])
+                    self.assertEqual(result["device"], "cpu")
+                    self.assertEqual(asr.load_model.call_args.kwargs["asr_config"]["providers"], ["CPUExecutionProvider"])
 
     def test_onnx_download_selects_quantized_weights_and_shared_preprocessors(self):
         published = [
@@ -373,7 +531,37 @@ class ModelTests(Files, unittest.TestCase):
         self.assertTrue(self.models.installed(self.models.get("parakeet-v3")))
 
 
+class LauncherTests(Files, unittest.TestCase):
+    def test_optional_cuda_libraries_are_added_before_python_starts(self):
+        venv = self.paths.data / "omawhisper/venv"
+        python = venv / "bin/python"
+        python.parent.mkdir(parents=True)
+        python.write_text(f"#!{sys.executable}\nimport os\nprint(os.environ.get('LD_LIBRARY_PATH', ''))\n")
+        python.chmod(0o700)
+        environment = {**os.environ, "XDG_DATA_HOME": str(self.paths.data.resolve()),
+                       "LD_LIBRARY_PATH": "/existing/cuda/lib"}
+        command = ["bash", "scripts/omawhisper", "request", '{"action":"status"}']
+        result = subprocess.run(command, env=environment, capture_output=True, text=True, check=True)
+        self.assertEqual(result.stdout.strip(), "/existing/cuda/lib")
+        libraries = venv / f"lib/python{sys.version_info.major}.{sys.version_info.minor}/site-packages/nvidia/cublas/lib"
+        libraries.mkdir(parents=True)
+        result = subprocess.run(command, env=environment, capture_output=True, text=True, check=True)
+        self.assertEqual(result.stdout.strip(), f"{libraries.resolve()}:/existing/cuda/lib")
+
 class ShortcutTests(unittest.IsolatedAsyncioTestCase):
+    async def test_symbol_shortcuts_register_and_reject_existing_bindings(self):
+        for key in ("COMMA", "PERIOD", "SLASH", "SEMICOLON", "APOSTROPHE",
+                    "BRACKETLEFT", "BRACKETRIGHT", "BACKSLASH", "GRAVE", "MINUS", "EQUAL", "PLUS"):
+            with self.subTest(key=key):
+                runner = AsyncMock(side_effect=[b"[]", b"ok"])
+                shortcuts = Shortcuts(runner)
+                await shortcuts.apply(f"SUPER+{key}", "hold")
+                self.assertIn(f"hl.bind({lua_string(f'SUPER+{key}')}", runner.call_args.args[-1])
+                runner.side_effect = None
+                runner.return_value = json.dumps([{"key": key.lower(), "modmask": 64, "description": "Other"}]).encode()
+                with self.assertRaisesRegex(UserError, "conflicts"):
+                    await shortcuts.apply(f"SUPER+{key}", "hold", force=True)
+
     async def test_default_does_not_steal_clipboard_manager(self):
         runner = AsyncMock(side_effect=[
             b'[{"key":"V","modmask":68,"description":"Clipboard manager"}]', b"ok",
@@ -623,7 +811,7 @@ class DaemonTests(Files, unittest.IsolatedAsyncioTestCase):
     async def test_exact_state_and_invalid_requests(self):
         self.assertEqual(set(self.daemon.snapshot()), {
             "phase", "level", "elapsed", "error", "message", "transcript", "model_name",
-            "config", "models", "devices", "history",
+            "config", "runtime", "models", "devices", "history",
         })
         for command in ([], {}, {"action": "bad"}, {"action": "configure", "values": {"threads": False}},
                         {"action": "load", "id": "unknown"}, {"action": "start", "unknown": True}):
@@ -669,6 +857,18 @@ class DaemonTests(Files, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.daemon.history, [])
         self.assertFalse((self.paths.state / "history.json").exists())
         self.output.deliver.assert_awaited_once()
+
+    async def test_impossible_model_rejected_before_microphone_opens(self):
+        self.daemon.config["model"] = "parakeet-v3-fp32"
+        self.daemon.capture_factory = MagicMock()
+        with (patch.object(self.daemon.models, "installed", return_value=True),
+              patch("omawhisper.models.memory_status", return_value={"total": 4 * 1024 ** 3, "available": 2 * 1024 ** 3}),
+              self.assertLogs("omawhisper.daemon", level="ERROR")):
+            response = await self.daemon.request({"action": "start"})
+        self.assertIn("estimated 5.00 GiB", response["error"])
+        self.daemon.capture_factory.assert_not_called()
+        self.output.focused.assert_not_awaited()
+        self.assertIsNone(self.daemon.job)
 
     async def test_push_to_talk_records_until_release_then_pastes(self):
         self.assertEqual(self.daemon.config["activation"], "hold")
@@ -755,6 +955,27 @@ class DaemonTests(Files, unittest.IsolatedAsyncioTestCase):
         self.daemon.models.loaded_id = "whisper-base"
         await self.daemon.request({"action": "configure", "values": {"model": "whisper-tiny"}})
         self.assertIsNone(self.daemon.models.loaded_id)
+
+    async def test_acceleration_change_unloads_and_persists_without_changing_microphone(self):
+        self.daemon.models.loaded_id = "whisper-base"
+        self.daemon.models.runtime = {"device": "cpu"}
+        self.daemon.config["device"] = "alsa_input.usb"
+        response = await self.daemon.request({"action": "configure", "values": {"acceleration": "gpu"}})
+        self.assertIsNone(self.daemon.models.loaded_id)
+        self.assertEqual(response["runtime"], {})
+        self.assertEqual(response["config"]["device"], "alsa_input.usb")
+        saved = json.loads((self.paths.config / "config.json").read_text())
+        self.assertEqual(saved["acceleration"], "gpu")
+
+    async def test_acceleration_change_is_rejected_while_recording(self):
+        await self.daemon.request({"action": "start"})
+        with self.assertLogs("omawhisper.daemon", level="ERROR"):
+            response = await self.daemon.request({"action": "configure", "values": {"acceleration": "gpu"}})
+        self.assertIn("busy", response["error"])
+        self.assertEqual(self.daemon.phase, "recording")
+        self.assertEqual(self.daemon.config["acceleration"], "auto")
+        await self.daemon.request({"action": "cancel"})
+        await self.daemon.job
 
     def add_command_model(self):
         self.daemon.models.add({

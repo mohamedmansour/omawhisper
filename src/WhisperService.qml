@@ -7,13 +7,14 @@ Item {
     property string transportError: ""
     property var state: ({
         phase: "idle", level: 0, elapsed: 0, error: "", message: "",
-        transcript: "", model_name: "", config: {}, models: [], devices: [], history: []
+        transcript: "", model_name: "", config: {}, runtime: {}, models: [], devices: [], history: []
     })
     property var pending: []
     property var current: null
     readonly property string executable: decodeURIComponent(Qt.resolvedUrl("../scripts/omawhisper").toString().replace(/^file:\/\//, ""))
     readonly property string error: transportError || state.error || ""
-    signal commandSucceeded(var request)
+    signal commandSucceeded(var request, var result)
+    signal commandFailed(var request, string message)
 
     function request(payload) {
         pending = pending.concat([payload]);
@@ -80,9 +81,16 @@ Item {
                     // CLI launch failures have plain-text diagnostics, not JSON.
                 }
                 root.transportError = detail || "Dictation service request failed.";
+                root.commandFailed(completed, root.transportError);
             } else {
                 root.transportError = "";
-                root.commandSucceeded(completed);
+                var result = null;
+                try {
+                    result = JSON.parse(response.text);
+                } catch (error) {
+                    // The watcher remains authoritative if a response has no snapshot.
+                }
+                root.commandSucceeded(completed, result);
             }
             Qt.callLater(root.next);
         }

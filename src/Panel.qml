@@ -16,6 +16,8 @@ Panel {
     property int cursor: -1
     property var editor: null
     property string localError: ""
+    property string localNotice: ""
+    property bool setupChecked: false
     readonly property var config: {
         var values = Object.assign({}, backend.state.config);
         if (bar && typeof bar.layoutEntries === "function") {
@@ -37,7 +39,7 @@ Panel {
     readonly property var currentView: views[tab]
     readonly property var tabNames: ["General", "Models", "Audio", "Advanced", "History"]
     readonly property bool recording: backend.state.phase === "recording"
-    readonly property bool busy: ["loading", "transcribing", "downloading"].indexOf(backend.state.phase) !== -1
+    readonly property bool busy: modelsView.processing.running || Settings.isBusy(backend.state.phase)
     readonly property string statusText: !backend.connected ? "Service offline"
         : recording ? "Listening  " + Math.floor(backend.state.elapsed) + "s"
         : busy ? backend.state.phase.charAt(0).toUpperCase() + backend.state.phase.slice(1)
@@ -52,10 +54,19 @@ Panel {
     }
     function close() {
         cancelEditor();
+        modelsView.processing.discard();
         controller.hide();
     }
     function focusPanel() { keyCatcher.forceActiveFocus(); }
     function cancelEditor() { if (editor) editor.finish(false); }
+    function resetScroll() { scroll.contentY = 0; }
+    function checkFirstRun() {
+        if (opened && backend.connected && !setupChecked) {
+            setupChecked = true;
+            if (!config.setup_complete)
+                changeTab(1);
+        }
+    }
     function changeTab(index) {
         cancelEditor();
         tab = (index + views.length) % views.length;
@@ -63,6 +74,7 @@ Panel {
         modelsView.deleteId = "";
         historyView.confirmClear = false;
         localError = "";
+        localNotice = "";
         scroll.contentY = 0;
         focusPanel();
     }
@@ -75,6 +87,9 @@ Panel {
         } else {
             currentView.adjust(cursor, dx);
         }
+    }
+    function tabNavigate(direction) {
+        changeTab(tab + direction);
     }
     function revealCursor() {
         Qt.callLater(function () {
@@ -95,12 +110,32 @@ Panel {
             currentView.activate(cursor);
     }
     function configure(key, value) {
+        if (busy)
+            return;
         localError = "";
         var values = {};
         values[key] = value;
         backend.request({ action: "configure", values: values });
     }
+    function preferenceAction(key) {
+        if (!backend.connected || busy || recording)
+            return;
+        if (key === "add_model") {
+            changeTab(1);
+            modelsView.startAdding();
+        } else if (key === "unload_model") {
+            backend.request({ action: "unload" });
+        } else {
+            localError = "Unknown settings action: " + key;
+        }
+    }
 
+    onOpenedChanged: {
+        if (opened)
+            checkFirstRun();
+        else
+            setupChecked = false;
+    }
     onRecordingChanged: if (recording) close()
     onCursorChanged: {
         if (modelsView.deleteId) {
@@ -112,6 +147,7 @@ Panel {
 
     WhisperService {
         id: backend
+        onConnectedChanged: root.checkFirstRun()
         onCommandSucceeded: function (request) {
             if (request.action === "configure" && request.values.bar_section !== undefined) {
                 barMove.command = ["omarchy", "bar", "move", root.moduleName, "--section", request.values.bar_section];
@@ -144,7 +180,7 @@ Panel {
             blocked: root.editor !== null
             onMoveRequested: function (dx, dy) { root.move(dx, dy); }
             onActivateRequested: root.activate()
-            onTabRequested: function (direction) { root.changeTab(root.tab + direction); }
+            onTabRequested: function (direction) { root.tabNavigate(direction); }
             onCloseRequested: {
                 if (modelsView.adding || modelsView.deleteId)
                     modelsView.cancel();
@@ -188,6 +224,17 @@ Panel {
                             font.pixelSize: Style.font.caption
                             elide: Text.ElideRight
                         }
+                        Text {
+                            width: parent.width
+                            visible: text !== ""
+                            text: Settings.runtimeLabel(backend.state.runtime)
+                                + (backend.state.runtime && backend.state.runtime.detail ? " - " + backend.state.runtime.detail : "")
+                            textFormat: Text.PlainText
+                            color: root.dim
+                            font.family: root.fontFamily
+                            font.pixelSize: Style.font.caption
+                            wrapMode: Text.WordWrap
+                        }
                     }
                 }
                 Rectangle {
@@ -197,8 +244,9 @@ Panel {
                     radius: Style.cornerRadius
                     Text {
                         anchors.centerIn: parent
-                        text: (root.config.shortcut || "SUPER+ALT+V").split("+").join(" + ")
+                        text: Settings.shortcutLabel(root.config.shortcut || "SUPER+ALT+V")
                             + (root.config.activation === "hold" ? "   Hold to speak" : "   Press to start / stop")
+                        textFormat: Text.PlainText
                         color: root.foreground
                         font.family: root.fontFamily
                         font.pixelSize: Style.font.bodySmall
@@ -226,8 +274,9 @@ Panel {
                 Text {
                     width: parent.width
                     visible: !backend.connected || text !== ""
-                    text: !backend.connected ? "Run scripts/install.sh from the Omawhisper folder to start the local service."
-                        : root.localError || backend.error || backend.state.message || ""
+                    text: !backend.connected ? "Connecting to the local dictation service..."
+                        : root.localError || (modelsView.processing.running && !modelsView.processing.accepted ? "" : backend.error)
+                            || root.localNotice || backend.state.message || ""
                     textFormat: Text.PlainText
                     color: root.localError || backend.error ? root.urgent : root.dim
                     font.family: root.fontFamily
@@ -235,6 +284,8 @@ Panel {
                     wrapMode: Text.WrapAnywhere
                     maximumLineCount: 4
                     elide: Text.ElideRight
+                    Accessible.role: Accessible.StaticText
+                    Accessible.name: text
                 }
             }
 
@@ -293,7 +344,8 @@ Panel {
                 id: footer
                 anchors.bottom: parent.bottom
                 width: parent.width
-                text: root.editor ? "Enter save   Esc cancel" : "Arrows navigate / adjust   Enter select   Tab switch tab   Esc close" + (root.tab === 1 && !modelsView.adding ? "   X remove" : "")
+                text: root.editor ? (root.editor.spec.kind === "shortcut" ? "Press your chord   " : "") + "Enter save   Esc cancel"
+                    : "Arrows navigate / adjust   Enter select   Tab switch tab   Esc close" + (root.tab === 1 && !modelsView.adding ? "   X remove" : "")
                 color: root.dim
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption

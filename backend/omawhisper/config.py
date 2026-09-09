@@ -14,7 +14,9 @@ DEFAULTS = {
     "language": "auto", "translate": False, "device": "", "output": "paste",
     "paste_shortcut": "auto", "restore_clipboard": True, "append_space": True,
     "history": False, "max_duration": 120, "beam_size": 5, "initial_prompt": "",
-    "vad": True, "compute_type": "int8", "threads": 4, "bar_section": "right",
+    "vad": True, "compute_type": "auto", "threads": 4, "bar_section": "right",
+    "acceleration": "auto",
+    "setup_complete": False,
     "suppress_blank": True, "show_timestamps": False, "temperature": 0.0,
     "no_speech_threshold": 0.6, "use_beam_search": False,
 }
@@ -54,7 +56,8 @@ def validate(values: dict, current: dict | None = None) -> dict:
     enums = {
         "activation": {"toggle", "hold"}, "output": {"paste", "clipboard"},
         "paste_shortcut": {"auto", "ctrl+v", "ctrl+shift+v", "shift+insert"},
-        "compute_type": {"int8", "float32", "int8_float32"},
+        "acceleration": {"auto", "gpu", "cpu"},
+        "compute_type": {"auto", "int8", "float32", "int8_float32", "float16", "int8_float16"},
         "bar_section": {"left", "center", "right"},
     }
     for key, choices in enums.items():

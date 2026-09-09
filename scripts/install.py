@@ -44,6 +44,7 @@ Type=simple
 ExecStart="{escaped}" daemon
 Restart=on-failure
 RestartSec=3
+OOMPolicy=continue
 TimeoutStopSec=15
 UMask=0077
 

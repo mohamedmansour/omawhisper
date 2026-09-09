@@ -23,11 +23,14 @@ Column {
             spec: modelData
             value: root.controller.config[modelData.key]
             hasCursor: root.controller.cursor === index
-            enabled: root.controller.service.connected
+            enabled: root.controller.service.connected && !root.controller.busy
+                && !(modelData.kind === "action" && root.controller.recording)
                 && !(modelData.whisperOnly && !root.controller.isWhisper)
+                && !(modelData.builtinOnly && root.controller.selectedModel && root.controller.selectedModel.engine === "command")
                 && !(modelData.key === "beam_size" && !root.controller.config.use_beam_search)
             onEngaged: root.controller.cursor = index
             onModified: function (value) { root.controller.configure(modelData.key, value); }
+            onActivated: root.controller.preferenceAction(modelData.key)
         }
     }
 }

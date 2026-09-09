@@ -12,9 +12,11 @@ license = "MIT"
 
 [project.optional-dependencies]
 whisper = ["faster-whisper>=1.1,<2"]
-parakeet = ["onnx-asr[cpu,hub]>=0.10,<1"]
-all = ["faster-whisper>=1.1,<2", "onnx-asr[cpu,hub]>=0.10,<1"]
-engines = ["faster-whisper>=1.1,<2", "onnx-asr[cpu,hub]>=0.10,<1"]
+parakeet = ["onnx-asr[cpu,hub]>=0.12,<0.13"]
+parakeet-cuda = ["onnx-asr[gpu,hub]>=0.12,<0.13", "onnxruntime-gpu[cuda,cudnn]>=1.24.2,<1.25"]
+all = ["faster-whisper>=1.1,<2", "onnx-asr[cpu,hub]>=0.12,<0.13"]
+engines = ["faster-whisper>=1.1,<2", "onnx-asr[cpu,hub]>=0.12,<0.13"]
+cuda = ["ctranslate2>=4.6.3,<5", "nvidia-cublas-cu12>=12.4,<13"]
 
 [project.scripts]
 omawhisper = "omawhisper.cli:main"

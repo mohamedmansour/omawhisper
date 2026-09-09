@@ -1,12 +1,16 @@
 import QtQuick
 import qs.Commons
 import qs.Ui
+import "Settings.js" as Settings
 
 Column {
     id: root
     required property var controller
     property bool adding: false
     property string deleteId: ""
+    property alias processing: deviceControl
+    readonly property var models: Settings.setupModels(controller.service.state.models, { acceleration: deviceControl.device })
+    readonly property int modelOffset: deviceControl.count
     property var draft: ({ id: "", name: "", engine: "whisper", source: "", architecture: "", quantization: "int8", argv: "[]" })
     readonly property var fields: [
         { key: "name", title: "Model name", help: "A friendly label for this model.", kind: "text" },
@@ -21,16 +25,46 @@ Column {
         ] },
         { key: "argv", title: "Custom command arguments", help: "JSON array, e.g. [\"my-asr\", \"{audio}\"]. Prints text to stdout. Custom engine only.", kind: "text" }
     ]
-    readonly property int count: adding ? fields.length + 2 : controller.service.state.models.length + 2
+    readonly property int count: adding ? fields.length + 2 : models.length + modelOffset
     spacing: Style.space(6)
 
     function rowAt(index) {
+        if (index < 0)
+            return null;
         if (adding)
             return index < fields.length ? form.itemAt(index) : (index === fields.length ? saveButton : cancelButton);
-        return index === 0 ? addButton : (index === 1 ? unloadButton : entries.itemAt(index - 2));
+        if (index < deviceControl.count)
+            return deviceControl.rowAt(index);
+        return entries.itemAt(index - modelOffset);
+    }
+
+    function loadingModel(identifier) {
+        return deviceControl.running && deviceControl.draft.model === identifier;
+    }
+
+    function startAdding() {
+        if (!controller.service.connected || controller.busy || controller.recording)
+            return;
+        controller.cancelEditor();
+        adding = true;
+        controller.cursor = 0;
+        controller.resetScroll();
+        controller.focusPanel();
     }
 
     function activate(index) {
+        if (!adding && index >= 0 && index < deviceControl.count) {
+            deviceControl.activate(index);
+            return;
+        }
+        if (!controller.service.connected)
+            return;
+        if (!adding && models[index - modelOffset] && loadingModel(models[index - modelOffset].id)) {
+            deviceControl.cancelJob();
+            return;
+        }
+        if (controller.busy || controller.recording)
+            return;
         if (adding) {
             if (index < fields.length) {
                 form.itemAt(index).activate();
@@ -40,20 +74,15 @@ Column {
                 save();
             else
                 cancel();
-        } else if (index === 0) {
-            adding = true;
-            controller.cursor = 0;
-        } else if (index === 1) {
-            controller.service.request({ action: "unload" });
         } else {
-            var model = controller.service.state.models[index - 2];
+            var model = models[index - modelOffset];
             if (!model)
                 return;
             if (deleteId === model.id) {
                 controller.service.request({ action: "remove_model", id: model.id });
                 deleteId = "";
             } else {
-                controller.service.request({ action: model.installed ? "load" : "download", id: model.id });
+                deviceControl.submit(model.id);
             }
         }
     }
@@ -61,12 +90,14 @@ Column {
     function adjust(index, direction) {
         if (adding && index < fields.length)
             form.itemAt(index).adjust(direction);
+        else if (!adding && index < deviceControl.count)
+            deviceControl.adjust(index, direction);
     }
 
     function removeSelected() {
-        if (adding || controller.cursor < 2)
+        if (adding || controller.cursor < modelOffset || controller.busy)
             return;
-        var model = controller.service.state.models[controller.cursor - 2];
+        var model = models[controller.cursor - modelOffset];
         if (model) {
             deleteId = model.id;
             controller.localError = "Remove " + model.name + "? Press Enter to confirm, or Escape to cancel.";
@@ -82,6 +113,8 @@ Column {
     }
 
     function save() {
+        if (!controller.service.connected || controller.busy)
+            return;
         var model = { id: draft.id.trim(), name: draft.name.trim(), engine: draft.engine, source: draft.source.trim() };
         if (model.engine === "parakeet" && draft.architecture.trim())
             model.architecture = draft.architecture.trim();
@@ -116,9 +149,16 @@ Column {
         }
     }
 
+    ProcessingView {
+        id: deviceControl
+        width: parent.width
+        visible: !root.adding
+        controller: root.controller
+    }
     Text {
         width: parent.width
-        text: root.adding ? "Bring your own model" : "Local models"
+        visible: root.adding
+        text: "Bring your own model"
         color: controller.foreground
         font.family: controller.fontFamily
         font.pixelSize: Style.font.subtitle
@@ -126,88 +166,58 @@ Column {
     }
     Text {
         width: parent.width
-        text: root.adding
-            ? "Whisper uses CTranslate2 weights. Parakeet uses onnx-asr-compatible repositories. A custom command can connect other local engines."
-            : "Download a model, then select it to load. No account or cloud transcription. Large models can use several GB of disk and memory."
+        visible: root.adding
+        text: "Whisper uses CTranslate2 weights. Parakeet uses onnx-asr-compatible repositories. A custom command can connect other local engines."
         color: controller.dim
         font.family: controller.fontFamily
         font.pixelSize: Style.font.caption
         wrapMode: Text.WordWrap
     }
-    Button {
-        id: addButton
-        width: parent.width
-        visible: !root.adding
-        text: "+ Add model"
-        leftAlign: true
-        bordered: true
-        foreground: controller.foreground
-        hasCursor: controller.cursor === 0
-        onClicked: root.activate(0)
-    }
-    Button {
-        id: unloadButton
-        width: parent.width
-        visible: !root.adding
-        text: "Unload model from memory"
-        leftAlign: true
-        foreground: controller.foreground
-        hasCursor: controller.cursor === 1
-        onClicked: root.activate(1)
-    }
     Repeater {
         id: entries
-        model: root.adding ? [] : root.controller.service.state.models
+        model: root.adding ? [] : root.models
         Button {
             id: modelButton
             required property var modelData
             required property int index
             width: root.width
-            implicitHeight: Style.space(76)
-            hasCursor: controller.cursor === index + 2
-            selected: modelData.loaded === true
+            implicitHeight: Style.space(42)
+            hasCursor: controller.cursor === index + root.modelOffset
+            selected: modelData.loaded === true || root.loadingModel(modelData.id)
             foreground: controller.foreground
-            onClicked: { controller.cursor = index + 2; root.activate(index + 2); }
+            enabled: controller.service.connected && !controller.recording
+                && (!controller.busy || (root.loadingModel(modelData.id) && !deviceControl.cancelling))
+            Accessible.name: modelData.name + ". " + status.text
+            Accessible.description: modelData.memory_error || modelData.compatibility.detail
+            onClicked: { controller.cursor = index + root.modelOffset; root.activate(index + root.modelOffset); }
 
-            Column {
+            Text {
                 anchors.left: parent.left
                 anchors.right: status.left
                 anchors.margins: Style.space(10)
                 anchors.verticalCenter: parent.verticalCenter
-                spacing: Style.space(4)
-                Text {
-                    width: parent.width
-                    text: modelButton.modelData.name
-                    textFormat: Text.PlainText
-                    color: controller.foreground
-                    font.family: controller.fontFamily
-                    font.pixelSize: Style.font.body
-                    font.bold: true
-                    elide: Text.ElideRight
-                }
-                Text {
-                    width: parent.width
-                    text: modelButton.modelData.description || modelButton.modelData.source || modelButton.modelData.engine
-                    textFormat: Text.PlainText
-                    color: controller.dim
-                    font.family: controller.fontFamily
-                    font.pixelSize: Style.font.caption
-                    elide: Text.ElideRight
-                }
+                text: modelButton.modelData.name
+                textFormat: Text.PlainText
+                color: controller.foreground
+                font.family: controller.fontFamily
+                font.pixelSize: Style.font.body
+                elide: Text.ElideMiddle
             }
             Text {
                 id: status
                 anchors.right: parent.right
                 anchors.rightMargin: Style.space(10)
                 anchors.verticalCenter: parent.verticalCenter
+                width: Math.min(implicitWidth, parent.width * 0.5)
                 text: root.deleteId === modelButton.modelData.id ? "Confirm removal"
-                    : modelButton.modelData.loaded ? "Loaded"
-                    : modelButton.modelData.progress === -1 ? "Downloading"
-                    : modelButton.modelData.progress > 0 && modelButton.modelData.progress < 100 ? Math.round(modelButton.modelData.progress) + "%"
-                    : modelButton.modelData.installed ? "Load  >" : "Download"
+                    : root.loadingModel(modelButton.modelData.id)
+                        ? (deviceControl.cancelling ? "Cancelling..." : Settings.modelProgress(deviceControl.phase) + " / Cancel")
+                    : Settings.modelStatus(modelButton.modelData, controller.config, controller.service.state.runtime, deviceControl.device)
+                textFormat: Text.PlainText
                 color: controller.foreground
                 font.family: controller.fontFamily
-                font.pixelSize: Style.font.bodySmall
+                font.pixelSize: Style.font.caption
+                elide: Text.ElideRight
             }
         }
     }
@@ -222,7 +232,8 @@ Column {
             spec: modelData
             value: root.draft[modelData.key]
             hasCursor: root.controller.cursor === index
-            enabled: (modelData.key !== "argv" || root.draft.engine === "command")
+            enabled: root.controller.service.connected && !root.controller.busy
+                && (modelData.key !== "argv" || root.draft.engine === "command")
                 && (modelData.key !== "architecture" || root.draft.engine === "parakeet")
                 && (modelData.key !== "quantization" || root.draft.engine === "parakeet")
             onEngaged: root.controller.cursor = index
@@ -236,6 +247,7 @@ Column {
     Button {
         id: saveButton
         visible: root.adding
+        enabled: controller.service.connected && !controller.busy
         width: parent.width
         text: "Add model"
         bordered: true
